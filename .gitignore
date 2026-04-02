@@ -1,0 +1,24 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.dll
+*.exe
+*.pdb
+
+## NuGet
+*.nupkg
+**/packages/
+
+## IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+
+## macOS
+.DS_Store
+Thumbs.db
