@@ -4,6 +4,24 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!-- NuGet Package Metadata -->
+    <PackageId>GenesisDB.Client</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Patric Eckhart</Authors>
+    <Company>GenesisDB</Company>
+    <Description>Official .NET client SDK for GenesisDB — a fast, GDPR-ready, CloudEvents-compatible event store database.</Description>
+    <PackageTags>genesisdb;eventstore;eventsourcing;database;sdk;cloudevents</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://www.genesisdb.io</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/genesisdb-io/genesisdb-io-client-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>

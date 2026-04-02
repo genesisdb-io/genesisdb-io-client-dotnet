@@ -17,6 +17,9 @@ public class GenesisDbException : Exception
     /// </summary>
     public string? ReasonPhrase { get; }
 
+    /// <summary>
+    /// Creates a new GenesisDbException.
+    /// </summary>
     public GenesisDbException(HttpStatusCode statusCode, string? reasonPhrase)
         : base($"API Error: {(int)statusCode} {reasonPhrase}")
     {
@@ -24,6 +27,9 @@ public class GenesisDbException : Exception
         ReasonPhrase = reasonPhrase;
     }
 
+    /// <summary>
+    /// Creates a new GenesisDbException with an inner exception.
+    /// </summary>
     public GenesisDbException(HttpStatusCode statusCode, string? reasonPhrase, Exception innerException)
         : base($"API Error: {(int)statusCode} {reasonPhrase}", innerException)
     {

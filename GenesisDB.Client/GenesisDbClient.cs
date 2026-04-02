@@ -340,6 +340,7 @@ public class GenesisDbClient : IDisposable
         return results;
     }
 
+    /// <inheritdoc />
     public void Dispose()
     {
         if (_ownsHttpClient)

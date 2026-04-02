@@ -8,27 +8,35 @@ namespace GenesisDB.Client;
 /// </summary>
 public class CloudEvent
 {
+    /// <summary>Unique event identifier.</summary>
     [JsonPropertyName("id")]
     public string? Id { get; set; }
 
+    /// <summary>CloudEvents source identifier.</summary>
     [JsonPropertyName("source")]
     public string? Source { get; set; }
 
+    /// <summary>Hierarchical subject path.</summary>
     [JsonPropertyName("subject")]
     public string? Subject { get; set; }
 
+    /// <summary>Event type identifier.</summary>
     [JsonPropertyName("type")]
     public string? Type { get; set; }
 
+    /// <summary>Event timestamp.</summary>
     [JsonPropertyName("time")]
     public string? Time { get; set; }
 
+    /// <summary>CloudEvents specification version.</summary>
     [JsonPropertyName("specversion")]
     public string? SpecVersion { get; set; }
 
+    /// <summary>Content type of the data payload.</summary>
     [JsonPropertyName("datacontenttype")]
     public string? DataContentType { get; set; }
 
+    /// <summary>Event payload data as a JSON element.</summary>
     [JsonPropertyName("data")]
     public JsonElement? Data { get; set; }
 
