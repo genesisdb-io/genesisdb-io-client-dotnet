@@ -105,7 +105,7 @@ public sealed record RegisteredSchema
     [JsonPropertyName("schema")] public JsonElement Schema { get; init; }
 }
 
-/// <summary>The body of GET /api/v1/status.</summary>
+/// <summary>The body of GET /api/v2/status.</summary>
 public sealed record Status
 {
     [JsonPropertyName("engine")] public EngineStatus Engine { get; init; } = new();

@@ -57,13 +57,13 @@ public sealed class GenesisDbClient : IDisposable
     // Health and status
 
     /// <summary>Liveness check. Needs no token on the server. Returns "Pong".</summary>
-    public Task<string> PingAsync(CancellationToken ct = default) => TextAsync("ping", HttpMethod.Get, "/ping", null, ct);
+    public Task<string> PingAsync(CancellationToken ct = default) => TextAsync("ping", HttpMethod.Get, "/api/v2/ping", null, ct);
 
     /// <summary>Engine version, host, event counts, storage format and readiness.</summary>
-    public Task<Status> StatusAsync(CancellationToken ct = default) => JsonAsync<Status>("status", HttpMethod.Get, "/api/v1/status", null, ct);
+    public Task<Status> StatusAsync(CancellationToken ct = default) => JsonAsync<Status>("status", HttpMethod.Get, "/api/v2/status", null, ct);
 
     /// <summary>Verify the hash chain of the whole store. Administrator token. Returns the audit text.</summary>
-    public Task<string> AuditAsync(CancellationToken ct = default) => TextAsync("audit", HttpMethod.Get, "/api/v1/status/audit", null, ct);
+    public Task<string> AuditAsync(CancellationToken ct = default) => TextAsync("audit", HttpMethod.Get, "/api/v2/admin/audit", null, ct);
 
     // Events
 
@@ -78,12 +78,12 @@ public sealed class GenesisDbClient : IDisposable
         var body = new JsonObject { ["events"] = JsonSerializer.SerializeToNode(list, Json.Options) };
         var conditions = preconditions?.ToList();
         if (conditions is { Count: > 0 }) body["preconditions"] = JsonSerializer.SerializeToNode(conditions, Json.Options);
-        return NdjsonAsync<Event>("commit", HttpMethod.Post, "/api/v1/commit", body, ct);
+        return NdjsonAsync<Event>("commit", HttpMethod.Post, "/api/v2/commit", body, ct);
     }
 
     /// <summary>Fetch the events of a subject and all of its descendants, in commit order.</summary>
     public Task<IReadOnlyList<Event>> FetchAsync(string subject, FetchOptions? options = null, CancellationToken ct = default) =>
-        NdjsonAsync<Event>("fetch", HttpMethod.Post, "/api/v1/fetch", FetchBody(subject, options), ct);
+        NdjsonAsync<Event>("fetch", HttpMethod.Post, "/api/v2/fetch", FetchBody(subject, options), ct);
 
     /// <summary>
     /// Subscribe to a subject and its descendants. Yields the history first, then new events as they are committed.
@@ -96,7 +96,7 @@ public sealed class GenesisDbClient : IDisposable
         var body = FetchBody(subject, options.Fetch);
         if (options.Interval is { } interval) body["interval"] = interval.TotalSeconds;
 
-        using var request = Request(HttpMethod.Post, "/api/v1/subscribe", body);
+        using var request = Request(HttpMethod.Post, "/api/v2/subscribe", body);
         HttpResponseMessage response;
         try
         {
@@ -169,17 +169,17 @@ public sealed class GenesisDbClient : IDisposable
 
     /// <summary>Run a GDBQL query. Returns the result rows, or a single-element list for a bare aggregate.</summary>
     public Task<IReadOnlyList<JsonElement>> QueryAsync(string query, CancellationToken ct = default) =>
-        NdjsonAsync<JsonElement>("query", HttpMethod.Post, "/api/v1/query", new JsonObject { ["query"] = query }, ct);
+        NdjsonAsync<JsonElement>("query", HttpMethod.Post, "/api/v2/query", new JsonObject { ["query"] = query }, ct);
 
     /// <summary>Run a GDBQL query and decode every row into <typeparamref name="T"/>.</summary>
     public Task<IReadOnlyList<T>> QueryAsync<T>(string query, CancellationToken ct = default) =>
-        NdjsonAsync<T>("query", HttpMethod.Post, "/api/v1/query", new JsonObject { ["query"] = query }, ct);
+        NdjsonAsync<T>("query", HttpMethod.Post, "/api/v2/query", new JsonObject { ["query"] = query }, ct);
 
     /// <summary>Distinct top level subjects, sorted.</summary>
-    public Task<IReadOnlyList<string>> SubjectsAsync(CancellationToken ct = default) => CatalogAsync("subjects", "/api/v1/subjects", "subject", ct);
+    public Task<IReadOnlyList<string>> SubjectsAsync(CancellationToken ct = default) => CatalogAsync("subjects", "/api/v2/subjects", "subject", ct);
 
     /// <summary>Distinct event types, sorted.</summary>
-    public Task<IReadOnlyList<string>> TypesAsync(CancellationToken ct = default) => CatalogAsync("types", "/api/v1/types", "type", ct);
+    public Task<IReadOnlyList<string>> TypesAsync(CancellationToken ct = default) => CatalogAsync("types", "/api/v2/types", "type", ct);
 
     private async Task<IReadOnlyList<string>> CatalogAsync(string operation, string path, string field, CancellationToken ct)
     {
@@ -193,12 +193,12 @@ public sealed class GenesisDbClient : IDisposable
     public async Task RegisterSchemaAsync(string eventType, object schema, CancellationToken ct = default)
     {
         var body = new JsonObject { ["type"] = eventType, ["schema"] = JsonSerializer.SerializeToNode(schema, Json.Options) };
-        using var response = await SendAsync("register_schema", HttpMethod.Post, "/api/v1/schemas", body, ct).ConfigureAwait(false);
+        using var response = await SendAsync("register_schema", HttpMethod.Post, "/api/v2/schemas", body, ct).ConfigureAwait(false);
     }
 
     /// <summary>Every registered schema.</summary>
     public Task<IReadOnlyList<RegisteredSchema>> SchemasAsync(CancellationToken ct = default) =>
-        NdjsonAsync<RegisteredSchema>("schemas", HttpMethod.Get, "/api/v1/schemas", null, ct);
+        NdjsonAsync<RegisteredSchema>("schemas", HttpMethod.Get, "/api/v2/schemas", null, ct);
 
     // Administration
 
@@ -208,7 +208,7 @@ public sealed class GenesisDbClient : IDisposable
     /// has no reference payloads. Administrator token. Returns the server's confirmation text.
     /// </summary>
     public Task<string> EraseAsync(string subject, CancellationToken ct = default) =>
-        TextAsync("erase", HttpMethod.Post, "/api/v1/erase", new JsonObject { ["subject"] = subject }, ct);
+        TextAsync("erase", HttpMethod.Post, "/api/v2/admin/erase", new JsonObject { ["subject"] = subject }, ct);
 
     // Transport
 

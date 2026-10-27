@@ -35,10 +35,10 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task PingSendsHeaders()
     {
-        _stub.Respond("/ping", 200, "Pong");
+        _stub.Respond("/api/v2/ping", 200, "Pong");
         Assert.Equal("Pong", await _db.PingAsync());
         var request = _stub.Requests[^1];
-        Assert.Equal("http://db.test/ping", request.Url);
+        Assert.Equal("http://db.test/api/v2/ping", request.Url);
         Assert.Equal("Bearer secret", request.Headers["Authorization"]);
         Assert.Equal("genesisdb-dotnet/2", request.Headers["User-Agent"]);
     }
@@ -46,7 +46,7 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task CommitSendsBodyAndParsesNdjson()
     {
-        _stub.Respond("/api/v1/commit", 200, Stored + "\n");
+        _stub.Respond("/api/v2/commit", 200, Stored + "\n");
         var events = await _db.CommitAsync(new[] { Event() }, new[] { Precondition.IsSubjectNew("/customer/1") });
         var body = LastBody();
         Assert.Equal("/customer/1", (string?)body["events"]![0]!["subject"]);
@@ -65,7 +65,7 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task CommitOmitsEmptyPreconditionsAndSerialisesReferenceOption()
     {
-        _stub.Respond("/api/v1/commit", 200, Stored + "\n");
+        _stub.Respond("/api/v2/commit", 200, Stored + "\n");
         await _db.CommitAsync(new[] { Event().AsReference() });
         var body = LastBody();
         Assert.Null(body["preconditions"]);
@@ -90,7 +90,7 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task PreconditionFailedIsParsed()
     {
-        _stub.Respond("/api/v1/commit", 412, "{\"type\":\"isSubjectNew\",\"message\":\"subject /customer/1 already exists\"}");
+        _stub.Respond("/api/v2/commit", 412, "{\"type\":\"isSubjectNew\",\"message\":\"subject /customer/1 already exists\"}");
         var e = await Assert.ThrowsAsync<PreconditionFailedException>(() => _db.CommitAsync(new[] { Event() }));
         Assert.Equal(412, e.Status);
         Assert.Equal("commit", e.Operation);
@@ -101,10 +101,10 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task FetchWithAndWithoutOptions()
     {
-        _stub.Respond("/api/v1/fetch", 200, Stored + "\n" + Stored + "\n");
+        _stub.Respond("/api/v2/fetch", 200, Stored + "\n" + Stored + "\n");
         Assert.Equal(2, (await _db.FetchAsync("/customer", new FetchOptions { LowerBound = "x", IncludeLowerBoundEvent = true })).Count);
         Assert.Equal("{\"subject\":\"/customer\",\"options\":{\"lowerBound\":\"x\",\"includeLowerBoundEvent\":true}}", _stub.Requests[^1].Body);
-        _stub.Respond("/api/v1/fetch", 200, "");
+        _stub.Respond("/api/v2/fetch", 200, "");
         Assert.Empty(await _db.FetchAsync("/customer"));
         Assert.Equal("{\"subject\":\"/customer\"}", _stub.Requests[^1].Body);
         Assert.Empty(await _db.FetchAsync("/customer", new FetchOptions()));
@@ -116,9 +116,9 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task QuerySubjectsTypes()
     {
-        _stub.Respond("/api/v1/query", 200, "{\"name\":\"Bruce\"}\n{\"name\":\"Selina\"}\n");
-        _stub.Respond("/api/v1/subjects", 200, "{\"subject\":\"/customer\"}\n{\"subject\":\"/order\"}\n");
-        _stub.Respond("/api/v1/types", 200, "{\"type\":\"customer.created\"}\n");
+        _stub.Respond("/api/v2/query", 200, "{\"name\":\"Bruce\"}\n{\"name\":\"Selina\"}\n");
+        _stub.Respond("/api/v2/subjects", 200, "{\"subject\":\"/customer\"}\n{\"subject\":\"/order\"}\n");
+        _stub.Respond("/api/v2/types", 200, "{\"type\":\"customer.created\"}\n");
         var rows = await _db.QueryAsync("STREAM e FROM events MAP { name: e.data.name }");
         Assert.Equal("Bruce", rows[0].GetProperty("name").GetString());
         var typed = await _db.QueryAsync<Row>("x");
@@ -130,7 +130,7 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task StatusIsMapped()
     {
-        _stub.Respond("/api/v1/status", 200, "{\"engine\":{\"version\":\"2.0.0\",\"channel\":\"stable\"},\"system\":{\"os\":\"linux\"},\"events\":{\"count\":3,\"subjects\":1,\"types\":2,\"storageSize\":100},\"storage\":{\"storageFormat\":\"v2\",\"ready\":true}}");
+        _stub.Respond("/api/v2/status", 200, "{\"engine\":{\"version\":\"2.0.0\",\"channel\":\"stable\"},\"system\":{\"os\":\"linux\"},\"events\":{\"count\":3,\"subjects\":1,\"types\":2,\"storageSize\":100},\"storage\":{\"storageFormat\":\"v2\",\"ready\":true}}");
         var status = await _db.StatusAsync();
         Assert.Equal("2.0.0", status.Engine.Version);
         Assert.Equal(3, status.Events.Count);
@@ -141,10 +141,10 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task SchemasAndAdmin()
     {
-        _stub.Respond("/api/v1/schemas", 201, "", "POST");
-        _stub.Respond("/api/v1/schemas", 200, "{\"type\":\"customer.created\",\"schema\":{\"type\":\"object\"}}\n", "GET");
-        _stub.Respond("/api/v1/status/audit", 200, "Audit passed");
-        _stub.Respond("/api/v1/erase", 200, "Erased");
+        _stub.Respond("/api/v2/schemas", 201, "", "POST");
+        _stub.Respond("/api/v2/schemas", 200, "{\"type\":\"customer.created\",\"schema\":{\"type\":\"object\"}}\n", "GET");
+        _stub.Respond("/api/v2/admin/audit", 200, "Audit passed");
+        _stub.Respond("/api/v2/admin/erase", 200, "Erased");
 
         await _db.RegisterSchemaAsync("customer.created", new { type = "object" });
         Assert.Equal("{\"type\":\"customer.created\",\"schema\":{\"type\":\"object\"}}", _stub.Requests[^1].Body);
@@ -166,7 +166,7 @@ public sealed class GenesisDbClientTests : IDisposable
     [InlineData(500, typeof(GenesisDbException))]
     public async Task ErrorClasses(int status, Type expected)
     {
-        _stub.Respond("/api/v1/fetch", status, "nope");
+        _stub.Respond("/api/v2/fetch", status, "nope");
         var e = await Assert.ThrowsAnyAsync<GenesisDbException>(() => _db.FetchAsync("/x"));
         Assert.IsType(expected, e);
         Assert.Equal(status, e.Status);
@@ -179,7 +179,7 @@ public sealed class GenesisDbClientTests : IDisposable
     public async Task SubscribeSkipsHeartbeatAndStopsOnError()
     {
         var stream = "data: " + Stored + "\n\ndata: {\"payload\":\"\"}\n\ndata: " + Stored + "\n\nevent: error\ndata: {\"error\":\"store closed\"}\n\n";
-        _stub.Respond("/api/v1/subscribe", 200, stream);
+        _stub.Respond("/api/v2/subscribe", 200, stream);
         var received = new List<Event>();
         var e = await Assert.ThrowsAsync<GenesisDbException>(async () =>
         {
@@ -196,7 +196,7 @@ public sealed class GenesisDbClientTests : IDisposable
     [Fact]
     public async Task SubscribeThrowsOnHttpError()
     {
-        _stub.Respond("/api/v1/subscribe", 401, "denied");
+        _stub.Respond("/api/v2/subscribe", 401, "denied");
         await Assert.ThrowsAsync<AuthenticationException>(async () =>
         {
             await foreach (var _ in _db.SubscribeAsync("/customer")) Assert.Fail("no event expected");
