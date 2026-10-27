@@ -2,350 +2,293 @@ using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace GenesisDB.Client;
 
 /// <summary>
-/// Client for interacting with GenesisDB.
+/// Client for GenesisDB.
+/// <code>
+/// var db = new GenesisDbClient("http://localhost:8080", Environment.GetEnvironmentVariable("GENESISDB_AUTH_TOKEN"));
+/// await db.CommitAsync(new[] { new NewEvent("app", "/customer/1", "customer.created", new { name = "Bruce" }) });
+/// var events = await db.FetchAsync("/customer");
+/// </code>
+/// <c>url</c> and <c>token</c> fall back to GENESISDB_URL and GENESISDB_AUTH_TOKEN. Every method throws
+/// <see cref="GenesisDbException"/> (or a subclass) on a non-2xx answer. Thread-safe, dispose when done.
 /// </summary>
-public class GenesisDbClient : IDisposable
+public sealed class GenesisDbClient : IDisposable
 {
-    private readonly string _apiUrl;
-    private readonly string _apiVersion;
-    private readonly string _authToken;
-    private readonly HttpClient _httpClient;
-    private readonly bool _ownsHttpClient;
+    public const string UserAgent = "genesisdb-dotnet/2";
+    private const string Heartbeat = "{\"payload\":\"\"}";
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    private readonly string _url;
+    private readonly string _token;
+    private readonly HttpClient _http;
+    private readonly bool _ownsHttp;
+
+    /// <param name="url">Base URL, for example http://localhost:8080. Falls back to GENESISDB_URL.</param>
+    /// <param name="token">Bearer token. Falls back to GENESISDB_AUTH_TOKEN.</param>
+    /// <param name="timeout">Timeout for non-streaming calls. Default 30 s. Subscriptions never time out.</param>
+    /// <param name="http">Bring your own HttpClient (proxies, TLS, handlers). Its timeout is ignored, pass <paramref name="timeout"/> instead.</param>
+    public GenesisDbClient(string? url = null, string? token = null, TimeSpan? timeout = null, HttpClient? http = null)
     {
-        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-    };
-
-    /// <summary>
-    /// Creates a new GenesisDB client using environment variables for configuration.
-    /// Required environment variables: GENESISDB_API_URL, GENESISDB_API_VERSION, GENESISDB_AUTH_TOKEN
-    /// </summary>
-    public GenesisDbClient() : this(null, null) { }
-
-    /// <summary>
-    /// Creates a new GenesisDB client with the specified configuration.
-    /// Missing config values fall back to environment variables.
-    /// </summary>
-    public GenesisDbClient(ClientConfig config) : this(config, null) { }
-
-    /// <summary>
-    /// Creates a new GenesisDB client with a custom HttpClient (useful for testing).
-    /// </summary>
-    public GenesisDbClient(ClientConfig? config, HttpClient? httpClient)
-    {
-        if (httpClient != null)
-        {
-            _httpClient = httpClient;
-            _ownsHttpClient = false;
-        }
-        else
-        {
-            _httpClient = new HttpClient();
-            _ownsHttpClient = true;
-        }
-
-        var envApiUrl = Environment.GetEnvironmentVariable("GENESISDB_API_URL");
-        var envApiVersion = Environment.GetEnvironmentVariable("GENESISDB_API_VERSION");
-        var envAuthToken = Environment.GetEnvironmentVariable("GENESISDB_AUTH_TOKEN");
-
-        _apiUrl = config?.ApiUrl ?? envApiUrl ?? string.Empty;
-        _apiVersion = config?.ApiVersion ?? envApiVersion ?? string.Empty;
-        _authToken = config?.AuthToken ?? envAuthToken ?? string.Empty;
-
-        if (string.IsNullOrEmpty(_apiUrl) || string.IsNullOrEmpty(_apiVersion) || string.IsNullOrEmpty(_authToken))
-        {
-            var missing = new List<string>();
-            if (string.IsNullOrEmpty(_apiUrl)) missing.Add("GENESISDB_API_URL");
-            if (string.IsNullOrEmpty(_apiVersion)) missing.Add("GENESISDB_API_VERSION");
-            if (string.IsNullOrEmpty(_authToken)) missing.Add("GENESISDB_AUTH_TOKEN");
-            throw new InvalidOperationException(
-                $"Missing required environment variables: {string.Join(", ", missing)}");
-        }
+        url = FirstNonEmpty(url, Environment.GetEnvironmentVariable("GENESISDB_URL"))
+            ?? throw new ArgumentException("GenesisDB URL missing: pass url or set GENESISDB_URL", nameof(url));
+        _token = FirstNonEmpty(token, Environment.GetEnvironmentVariable("GENESISDB_AUTH_TOKEN"))
+            ?? throw new ArgumentException("GenesisDB token missing: pass token or set GENESISDB_AUTH_TOKEN", nameof(token));
+        _url = url.TrimEnd('/');
+        Timeout = timeout ?? TimeSpan.FromSeconds(30);
+        _ownsHttp = http is null;
+        _http = http ?? new HttpClient();
+        // Per-request timeouts are enforced with a CancellationTokenSource, so the HttpClient must not cut streams.
+        _http.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
     }
 
-    /// <summary>
-    /// Streams events for a subject from GenesisDB.
-    /// </summary>
-    /// <param name="subject">The subject path to stream events for.</param>
-    /// <param name="options">Optional streaming options (bounds, filters).</param>
-    /// <returns>A list of CloudEvents.</returns>
-    public async Task<List<CloudEvent>> StreamEventsAsync(string subject, StreamOptions? options = null)
+    /// <summary>Timeout for non-streaming calls.</summary>
+    public TimeSpan Timeout { get; }
+
+    private static string? FirstNonEmpty(string? a, string? b) => !string.IsNullOrEmpty(a) ? a : !string.IsNullOrEmpty(b) ? b : null;
+
+    public void Dispose()
     {
-        var url = $"{_apiUrl}/api/{_apiVersion}/stream";
-
-        var requestBody = new Dictionary<string, object> { ["subject"] = subject };
-        if (options != null)
-        {
-            requestBody["options"] = options;
-        }
-
-        var request = CreateRequest(HttpMethod.Post, url, requestBody);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/x-ndjson"));
-
-        var response = await _httpClient.SendAsync(request);
-        await EnsureSuccessAsync(response);
-
-        var rawText = await response.Content.ReadAsStringAsync();
-        return ParseNdjsonCloudEvents(rawText);
+        if (_ownsHttp) _http.Dispose();
     }
 
+    // Health and status
+
+    /// <summary>Liveness check. Needs no token on the server. Returns "Pong".</summary>
+    public Task<string> PingAsync(CancellationToken ct = default) => TextAsync("ping", HttpMethod.Get, "/ping", null, ct);
+
+    /// <summary>Engine version, host, event counts, storage format and readiness.</summary>
+    public Task<Status> StatusAsync(CancellationToken ct = default) => JsonAsync<Status>("status", HttpMethod.Get, "/api/v1/status", null, ct);
+
+    /// <summary>Verify the hash chain of the whole store. Administrator token. Returns the audit text.</summary>
+    public Task<string> AuditAsync(CancellationToken ct = default) => TextAsync("audit", HttpMethod.Get, "/api/v1/status/audit", null, ct);
+
+    // Events
+
     /// <summary>
-    /// Commits events to GenesisDB.
+    /// Commit events atomically after checking the preconditions. Returns the stored events.
+    /// A failed precondition throws <see cref="PreconditionFailedException"/> and writes nothing.
     /// </summary>
-    /// <param name="events">Array of events to commit.</param>
-    /// <param name="preconditions">Optional preconditions to check before committing.</param>
-    public async Task CommitEventsAsync(IEnumerable<CommitEvent> events, IEnumerable<Precondition>? preconditions = null)
+    public Task<IReadOnlyList<Event>> CommitAsync(IEnumerable<NewEvent> events, IEnumerable<Precondition>? preconditions = null, CancellationToken ct = default)
     {
-        var url = $"{_apiUrl}/api/{_apiVersion}/commit";
-
-        var requestBody = new Dictionary<string, object>
-        {
-            ["events"] = events
-        };
-
-        var preconditionsList = preconditions?.ToList();
-        if (preconditionsList != null && preconditionsList.Count > 0)
-        {
-            requestBody["preconditions"] = preconditionsList;
-        }
-
-        var request = CreateRequest(HttpMethod.Post, url, requestBody);
-        var response = await _httpClient.SendAsync(request);
-        await EnsureSuccessAsync(response);
+        var list = events.ToList();
+        if (list.Count == 0) throw new ArgumentException("commit requires at least one event", nameof(events));
+        var body = new JsonObject { ["events"] = JsonSerializer.SerializeToNode(list, Json.Options) };
+        var conditions = preconditions?.ToList();
+        if (conditions is { Count: > 0 }) body["preconditions"] = JsonSerializer.SerializeToNode(conditions, Json.Options);
+        return NdjsonAsync<Event>("commit", HttpMethod.Post, "/api/v1/commit", body, ct);
     }
 
-    /// <summary>
-    /// Erases data for a subject (GDPR compliance).
-    /// </summary>
-    /// <param name="subject">The subject to erase data for.</param>
-    public async Task EraseDataAsync(string subject)
-    {
-        var url = $"{_apiUrl}/api/{_apiVersion}/erase";
-
-        var requestBody = new { subject };
-        var request = CreateRequest(HttpMethod.Post, url, requestBody);
-        var response = await _httpClient.SendAsync(request);
-        await EnsureSuccessAsync(response);
-    }
+    /// <summary>Fetch the events of a subject and all of its descendants, in commit order.</summary>
+    public Task<IReadOnlyList<Event>> FetchAsync(string subject, FetchOptions? options = null, CancellationToken ct = default) =>
+        NdjsonAsync<Event>("fetch", HttpMethod.Post, "/api/v1/fetch", FetchBody(subject, options), ct);
 
     /// <summary>
-    /// Gets audit information from GenesisDB.
+    /// Subscribe to a subject and its descendants. Yields the history first, then new events as they are committed.
+    /// Runs until the token is cancelled or the server ends the stream. A stream the server ends with an error
+    /// throws <see cref="GenesisDbException"/>.
     /// </summary>
-    /// <returns>Audit information as a string.</returns>
-    public async Task<string> AuditAsync()
+    public async IAsyncEnumerable<Event> SubscribeAsync(string subject, SubscribeOptions? options = null, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var url = $"{_apiUrl}/api/{_apiVersion}/status/audit";
+        options ??= new SubscribeOptions();
+        var body = FetchBody(subject, options.Fetch);
+        if (options.Interval is { } interval) body["interval"] = interval.TotalSeconds;
 
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
-        request.Headers.Add("User-Agent", "genesisdb-sdk-dotnet");
-        request.Content = new StringContent(string.Empty, Encoding.UTF8, "text/plain");
-
-        var response = await _httpClient.SendAsync(request);
-        await EnsureSuccessAsync(response);
-        return await response.Content.ReadAsStringAsync();
-    }
-
-    /// <summary>
-    /// Pings the GenesisDB server.
-    /// </summary>
-    /// <returns>The ping response (typically "pong").</returns>
-    public async Task<string> PingAsync()
-    {
-        var url = $"{_apiUrl}/api/{_apiVersion}/status/ping";
-
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
-        request.Headers.Add("User-Agent", "genesisdb-sdk-dotnet");
-        request.Content = new StringContent(string.Empty, Encoding.UTF8, "text/plain");
-
-        var response = await _httpClient.SendAsync(request);
-        await EnsureSuccessAsync(response);
-        return await response.Content.ReadAsStringAsync();
-    }
-
-    /// <summary>
-    /// Executes a GDBQL query against GenesisDB.
-    /// </summary>
-    /// <param name="query">The GDBQL query string.</param>
-    /// <returns>A list of JSON results.</returns>
-    public async Task<List<JsonElement>> QueryAsync(string query)
-    {
-        var url = $"{_apiUrl}/api/{_apiVersion}/q";
-
-        var requestBody = new { query };
-        var request = CreateRequest(HttpMethod.Post, url, requestBody);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/x-ndjson"));
-
-        var response = await _httpClient.SendAsync(request);
-        await EnsureSuccessAsync(response);
-
-        var rawText = await response.Content.ReadAsStringAsync();
-        return ParseNdjsonResults(rawText);
-    }
-
-    /// <summary>
-    /// Alias for QueryAsync. Executes a GDBQL query against GenesisDB.
-    /// </summary>
-    public Task<List<JsonElement>> QueryEventsAsync(string query) => QueryAsync(query);
-
-    /// <summary>
-    /// Observes events for a subject as an async stream.
-    /// The stream stays open and yields new events as they arrive.
-    /// </summary>
-    /// <param name="subject">The subject path to observe.</param>
-    /// <param name="options">Optional streaming options.</param>
-    /// <param name="cancellationToken">Cancellation token to stop observing.</param>
-    /// <returns>An async enumerable of CloudEvents.</returns>
-    public async IAsyncEnumerable<CloudEvent> ObserveEventsAsync(
-        string subject,
-        StreamOptions? options = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        var url = $"{_apiUrl}/api/{_apiVersion}/observe";
-
-        var requestBody = new Dictionary<string, object> { ["subject"] = subject };
-        if (options != null)
-        {
-            requestBody["options"] = options;
-        }
-
-        var request = CreateRequest(HttpMethod.Post, url, requestBody);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/x-ndjson"));
-
-        var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        await EnsureSuccessAsync(response);
-
-        var stream = await response.Content.ReadAsStreamAsync();
-        using var reader = new StreamReader(stream);
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var line = await reader.ReadLineAsync();
-            if (line == null) break; // stream ended
-
-            var trimmed = line.Trim();
-            if (string.IsNullOrEmpty(trimmed)) continue;
-
-            // Handle SSE format with "data: " prefix
-            var jsonStr = trimmed.StartsWith("data: ") ? trimmed[6..] : trimmed;
-
-            var cloudEvent = TryParseObservedEvent(jsonStr);
-            if (cloudEvent != null)
-            {
-                yield return cloudEvent;
-            }
-        }
-    }
-
-    private static CloudEvent? TryParseObservedEvent(string jsonStr)
-    {
+        using var request = Request(HttpMethod.Post, "/api/v1/subscribe", body);
+        HttpResponseMessage response;
         try
         {
-            var json = JsonSerializer.Deserialize<JsonElement>(jsonStr);
-
-            // Skip heartbeat messages
-            if (json.ValueKind == JsonValueKind.Object &&
-                json.TryGetProperty("payload", out var payload) &&
-                payload.ValueKind == JsonValueKind.String &&
-                payload.GetString() == "" &&
-                json.EnumerateObject().Count() == 1)
-            {
-                return null;
-            }
-
-            return JsonSerializer.Deserialize<CloudEvent>(jsonStr);
+            response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         }
-        catch (JsonException)
+        catch (HttpRequestException e)
         {
-            return null;
+            throw new GenesisDbException("subscribe", e.Message, e);
+        }
+        using (response)
+        {
+            if ((int)response.StatusCode != 200)
+            {
+                throw GenesisDbException.ForResponse("subscribe", (int)response.StatusCode, await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+            }
+            using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            var eventName = "";
+            while (true)
+            {
+                string? line;
+                try
+                {
+#if NET7_0_OR_GREATER
+                    line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+#else
+                    line = await reader.ReadLineAsync().WaitAsync(ct).ConfigureAwait(false);
+#endif
+                }
+                catch (IOException) when (ct.IsCancellationRequested)
+                {
+                    yield break;
+                }
+                catch (ObjectDisposedException) when (ct.IsCancellationRequested)
+                {
+                    yield break;
+                }
+                if (line is null) yield break;
+                if (line.StartsWith("event: ", StringComparison.Ordinal))
+                {
+                    eventName = line[7..].Trim();
+                    continue;
+                }
+                if (!line.StartsWith("data: ", StringComparison.Ordinal))
+                {
+                    eventName = "";
+                    continue;
+                }
+                var payload = line[6..];
+                if (eventName == "error")
+                {
+                    var message = payload;
+                    try
+                    {
+                        using var parsed = JsonDocument.Parse(payload);
+                        if (parsed.RootElement.TryGetProperty("error", out var error)) message = error.GetString() ?? payload;
+                    }
+                    catch (JsonException)
+                    {
+                        // keep the raw payload
+                    }
+                    throw new GenesisDbException("subscribe ended", 200, message);
+                }
+                eventName = "";
+                if (payload.Trim() == Heartbeat) continue;
+                yield return Decode<Event>("subscribe", payload);
+            }
         }
     }
 
-    private HttpRequestMessage CreateRequest(HttpMethod method, string url, object? body = null)
+    /// <summary>Run a GDBQL query. Returns the result rows, or a single-element list for a bare aggregate.</summary>
+    public Task<IReadOnlyList<JsonElement>> QueryAsync(string query, CancellationToken ct = default) =>
+        NdjsonAsync<JsonElement>("query", HttpMethod.Post, "/api/v1/query", new JsonObject { ["query"] = query }, ct);
+
+    /// <summary>Run a GDBQL query and decode every row into <typeparamref name="T"/>.</summary>
+    public Task<IReadOnlyList<T>> QueryAsync<T>(string query, CancellationToken ct = default) =>
+        NdjsonAsync<T>("query", HttpMethod.Post, "/api/v1/query", new JsonObject { ["query"] = query }, ct);
+
+    /// <summary>Distinct top level subjects, sorted.</summary>
+    public Task<IReadOnlyList<string>> SubjectsAsync(CancellationToken ct = default) => CatalogAsync("subjects", "/api/v1/subjects", "subject", ct);
+
+    /// <summary>Distinct event types, sorted.</summary>
+    public Task<IReadOnlyList<string>> TypesAsync(CancellationToken ct = default) => CatalogAsync("types", "/api/v1/types", "type", ct);
+
+    private async Task<IReadOnlyList<string>> CatalogAsync(string operation, string path, string field, CancellationToken ct)
     {
-        var request = new HttpRequestMessage(method, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _authToken);
-        request.Headers.Add("User-Agent", "genesisdb-sdk-dotnet");
+        var rows = await NdjsonAsync<JsonElement>(operation, HttpMethod.Get, path, null, ct).ConfigureAwait(false);
+        return rows.Select(row => row.GetProperty(field).GetString() ?? "").ToList();
+    }
 
-        if (body != null)
+    // Schemas
+
+    /// <summary>Register a schema for an event type. Throws <see cref="ConflictException"/> when the type already has one. Administrator token.</summary>
+    public async Task RegisterSchemaAsync(string eventType, object schema, CancellationToken ct = default)
+    {
+        var body = new JsonObject { ["type"] = eventType, ["schema"] = JsonSerializer.SerializeToNode(schema, Json.Options) };
+        using var response = await SendAsync("register_schema", HttpMethod.Post, "/api/v1/schemas", body, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Every registered schema.</summary>
+    public Task<IReadOnlyList<RegisteredSchema>> SchemasAsync(CancellationToken ct = default) =>
+        NdjsonAsync<RegisteredSchema>("schemas", HttpMethod.Get, "/api/v1/schemas", null, ct);
+
+    // Administration
+
+    /// <summary>
+    /// Erase every reference payload below a subject. Inline event data is immutable and stays. Throws
+    /// <see cref="NotFoundException"/> when the subject has no events, <see cref="UnprocessableException"/> when it
+    /// has no reference payloads. Administrator token. Returns the server's confirmation text.
+    /// </summary>
+    public Task<string> EraseAsync(string subject, CancellationToken ct = default) =>
+        TextAsync("erase", HttpMethod.Post, "/api/v1/erase", new JsonObject { ["subject"] = subject }, ct);
+
+    // Transport
+
+    private static JsonObject FetchBody(string subject, FetchOptions? options)
+    {
+        var body = new JsonObject { ["subject"] = subject };
+        if (options is { IsEmpty: false }) body["options"] = JsonSerializer.SerializeToNode(options, Json.Options);
+        return body;
+    }
+
+    private HttpRequestMessage Request(HttpMethod method, string path, JsonNode? body)
+    {
+        var request = new HttpRequestMessage(method, _url + path);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+        request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
+        if (body is not null)
         {
-            var json = JsonSerializer.Serialize(body, JsonOptions);
-            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            request.Content = new StringContent(body.ToJsonString(Json.Options), Encoding.UTF8, "application/json");
         }
-
         return request;
     }
 
-    private static Task EnsureSuccessAsync(HttpResponseMessage response)
+    private async Task<HttpResponseMessage> SendAsync(string operation, HttpMethod method, string path, JsonNode? body, CancellationToken ct)
     {
-        if (!response.IsSuccessStatusCode)
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(Timeout);
+        using var request = Request(method, path, body);
+        HttpResponseMessage response;
+        try
         {
-            throw new GenesisDbException(response.StatusCode, response.ReasonPhrase);
+            response = await _http.SendAsync(request, HttpCompletionOption.ResponseContentRead, timeout.Token).ConfigureAwait(false);
         }
-        return Task.CompletedTask;
+        catch (HttpRequestException e)
+        {
+            throw new GenesisDbException(operation, e.Message, e);
+        }
+        catch (OperationCanceledException e) when (!ct.IsCancellationRequested)
+        {
+            throw new GenesisDbException(operation, $"timed out after {Timeout.TotalSeconds:0.#} s", e);
+        }
+        var status = (int)response.StatusCode;
+        if (status < 200 || status > 299)
+        {
+            var text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            response.Dispose();
+            throw GenesisDbException.ForResponse(operation, status, text);
+        }
+        return response;
     }
 
-    private static List<CloudEvent> ParseNdjsonCloudEvents(string rawText)
+    private async Task<string> TextAsync(string operation, HttpMethod method, string path, JsonNode? body, CancellationToken ct)
     {
-        var events = new List<CloudEvent>();
-        if (string.IsNullOrWhiteSpace(rawText)) return events;
-
-        foreach (var line in rawText.Split('\n'))
-        {
-            var trimmed = line.Trim();
-            if (string.IsNullOrEmpty(trimmed)) continue;
-
-            try
-            {
-                var cloudEvent = JsonSerializer.Deserialize<CloudEvent>(trimmed);
-                if (cloudEvent != null) events.Add(cloudEvent);
-            }
-            catch (JsonException)
-            {
-                // Skip malformed lines
-            }
-        }
-
-        return events;
+        using var response = await SendAsync(operation, method, path, body, ct).ConfigureAwait(false);
+        return await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
     }
 
-    private static List<JsonElement> ParseNdjsonResults(string rawText)
+    private async Task<T> JsonAsync<T>(string operation, HttpMethod method, string path, JsonNode? body, CancellationToken ct) =>
+        Decode<T>(operation, await TextAsync(operation, method, path, body, ct).ConfigureAwait(false));
+
+    private async Task<IReadOnlyList<T>> NdjsonAsync<T>(string operation, HttpMethod method, string path, JsonNode? body, CancellationToken ct)
     {
-        var results = new List<JsonElement>();
-        if (string.IsNullOrWhiteSpace(rawText)) return results;
-
-        foreach (var line in rawText.Split('\n'))
+        var text = await TextAsync(operation, method, path, body, ct).ConfigureAwait(false);
+        var rows = new List<T>();
+        foreach (var line in text.Split('\n'))
         {
-            var trimmed = line.Trim();
-            if (string.IsNullOrEmpty(trimmed)) continue;
-
-            try
-            {
-                var json = JsonSerializer.Deserialize<JsonElement>(trimmed);
-                results.Add(json);
-            }
-            catch (JsonException)
-            {
-                // Skip malformed lines
-            }
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            rows.Add(Decode<T>(operation, line));
         }
-
-        return results;
+        return rows;
     }
 
-    /// <inheritdoc />
-    public void Dispose()
+    private static T Decode<T>(string operation, string json)
     {
-        if (_ownsHttpClient)
+        try
         {
-            _httpClient.Dispose();
+            return JsonSerializer.Deserialize<T>(json, Json.Options) ?? throw new GenesisDbException(operation, 0, "empty JSON value in response");
+        }
+        catch (JsonException e)
+        {
+            throw new GenesisDbException(operation, "invalid JSON in response", e);
         }
     }
 }

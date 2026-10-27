@@ -1,635 +1,229 @@
 using System.Net;
+using System.Text;
 using System.Text.Json;
-using RichardSzalay.MockHttp;
+using System.Text.Json.Nodes;
 
 namespace GenesisDB.Client.Tests;
 
-public class GenesisDbClientTests : IDisposable
+/// <summary>Unit tests against a stubbed HttpMessageHandler. See IntegrationTests for the live tests.</summary>
+public sealed class GenesisDbClientTests : IDisposable
 {
-    private readonly MockHttpMessageHandler _mockHttp;
-    private readonly GenesisDbClient _client;
+    private const string Stored = "{\"source\":\"app\",\"subject\":\"/customer/1\",\"type\":\"customer.created\",\"specversion\":\"1.0\",\"id\":\"0199c0e0-0000-7000-8000-000000000001\",\"time\":\"2026-10-24T10:00:00.123456789Z\",\"datacontenttype\":\"application/json\",\"predecessorhash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"data\":{\"name\":\"Bruce\"},\"hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+
+    private readonly StubHandler _stub = new();
+    private readonly GenesisDbClient _db;
 
     public GenesisDbClientTests()
     {
-        _mockHttp = new MockHttpMessageHandler();
-        _client = new GenesisDbClient(
-            new ClientConfig
-            {
-                ApiUrl = "http://localhost:8080",
-                ApiVersion = "v1",
-                AuthToken = "test-token"
-            },
-            _mockHttp.ToHttpClient()
-        );
+        _db = new GenesisDbClient("http://db.test/", "secret", http: new HttpClient(_stub));
     }
 
-    public void Dispose()
-    {
-        _client.Dispose();
-        _mockHttp.Dispose();
-    }
+    public void Dispose() => _db.Dispose();
 
-    #region Constructor Tests
+    private static NewEvent Event(string subject = "/customer/1") => new("app", subject, "customer.created", new { name = "Bruce" });
+
+    private JsonNode LastBody() => JsonNode.Parse(_stub.Requests[^1].Body)!;
 
     [Fact]
-    public void Constructor_WithFullConfig_CreatesClient()
+    public void ConfigRequiresUrlAndToken()
     {
-        using var client = new GenesisDbClient(new ClientConfig
-        {
-            ApiUrl = "http://custom.api.com",
-            ApiVersion = "v2",
-            AuthToken = "custom-token"
-        });
-        Assert.NotNull(client);
+        if (Environment.GetEnvironmentVariable("GENESISDB_URL") is not null && Environment.GetEnvironmentVariable("GENESISDB_AUTH_TOKEN") is not null) return;
+        Assert.Throws<ArgumentException>(() => new GenesisDbClient(token: "t"));
+        Assert.Throws<ArgumentException>(() => new GenesisDbClient(url: "http://x"));
     }
 
     [Fact]
-    public void Constructor_WithMissingConfig_ThrowsException()
+    public async Task PingSendsHeaders()
     {
-        // Clear env vars to ensure they don't interfere
-        var origUrl = Environment.GetEnvironmentVariable("GENESISDB_API_URL");
-        var origVersion = Environment.GetEnvironmentVariable("GENESISDB_API_VERSION");
-        var origToken = Environment.GetEnvironmentVariable("GENESISDB_AUTH_TOKEN");
-        try
-        {
-            Environment.SetEnvironmentVariable("GENESISDB_API_URL", null);
-            Environment.SetEnvironmentVariable("GENESISDB_API_VERSION", null);
-            Environment.SetEnvironmentVariable("GENESISDB_AUTH_TOKEN", null);
-
-            var ex = Assert.Throws<InvalidOperationException>(() => new GenesisDbClient());
-            Assert.Contains("GENESISDB_API_URL", ex.Message);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("GENESISDB_API_URL", origUrl);
-            Environment.SetEnvironmentVariable("GENESISDB_API_VERSION", origVersion);
-            Environment.SetEnvironmentVariable("GENESISDB_AUTH_TOKEN", origToken);
-        }
+        _stub.Respond("/ping", 200, "Pong");
+        Assert.Equal("Pong", await _db.PingAsync());
+        var request = _stub.Requests[^1];
+        Assert.Equal("http://db.test/ping", request.Url);
+        Assert.Equal("Bearer secret", request.Headers["Authorization"]);
+        Assert.Equal("genesisdb-dotnet/2", request.Headers["User-Agent"]);
     }
 
     [Fact]
-    public void Constructor_WithPartialConfig_ThrowsForMissing()
+    public async Task CommitSendsBodyAndParsesNdjson()
     {
-        var origUrl = Environment.GetEnvironmentVariable("GENESISDB_API_URL");
-        try
-        {
-            Environment.SetEnvironmentVariable("GENESISDB_API_URL", null);
-            var ex = Assert.Throws<InvalidOperationException>(() =>
-                new GenesisDbClient(new ClientConfig { ApiVersion = "v1", AuthToken = "token" }));
-            Assert.Contains("GENESISDB_API_URL", ex.Message);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("GENESISDB_API_URL", origUrl);
-        }
-    }
-
-    #endregion
-
-    #region StreamEvents Tests
-
-    [Fact]
-    public async Task StreamEventsAsync_ReturnsCloudEvents()
-    {
-        var mockEvent = new
-        {
-            id = "1",
-            source = "test",
-            subject = "/test",
-            type = "test.event",
-            data = new { message = "test" }
-        };
-
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/stream")
-            .Respond("application/x-ndjson", JsonSerializer.Serialize(mockEvent) + "\n");
-
-        var events = await _client.StreamEventsAsync("/test");
-
+        _stub.Respond("/api/v1/commit", 200, Stored + "\n");
+        var events = await _db.CommitAsync(new[] { Event() }, new[] { Precondition.IsSubjectNew("/customer/1") });
+        var body = LastBody();
+        Assert.Equal("/customer/1", (string?)body["events"]![0]!["subject"]);
+        Assert.Equal("Bruce", (string?)body["events"]![0]!["data"]!["name"]);
+        Assert.Null(body["events"]![0]!["options"]);
+        Assert.Equal("isSubjectNew", (string?)body["preconditions"]![0]!["type"]);
+        Assert.Equal("/customer/1", (string?)body["preconditions"]![0]!["payload"]!["subject"]);
         Assert.Single(events);
-        Assert.Equal("1", events[0].Id);
-        Assert.Equal("test", events[0].Source);
-        Assert.Equal("/test", events[0].Subject);
-        Assert.Equal("test.event", events[0].Type);
+        Assert.Equal("0199c0e0-0000-7000-8000-000000000001", events[0].Id);
+        Assert.Equal("Bruce", events[0].Data.GetProperty("name").GetString());
+        Assert.Equal(new string('a', 64), events[0].Hash);
+        Assert.Equal(new DateTimeOffset(2026, 10, 24, 10, 0, 0, TimeSpan.Zero).AddTicks(1234567), events[0].Time);
+        Assert.Equal("Bruce", events[0].DataAs<Dictionary<string, string>>()!["name"]);
     }
 
     [Fact]
-    public async Task StreamEventsAsync_WithOptions_SendsCorrectBody()
+    public async Task CommitOmitsEmptyPreconditionsAndSerialisesReferenceOption()
     {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/stream")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("subject").GetString() == "/test" &&
-                       json.GetProperty("options").GetProperty("lowerBound").GetString() == "123" &&
-                       json.GetProperty("options").GetProperty("includeLowerBoundEvent").GetBoolean() == true &&
-                       json.GetProperty("options").GetProperty("latestByEventType").GetString() == "test.type";
-            })
-            .Respond("application/x-ndjson", "");
+        _stub.Respond("/api/v1/commit", 200, Stored + "\n");
+        await _db.CommitAsync(new[] { Event().AsReference() });
+        var body = LastBody();
+        Assert.Null(body["preconditions"]);
+        Assert.True((bool?)body["events"]![0]!["options"]!["storeDataAsReference"]);
+    }
 
-        await _client.StreamEventsAsync("/test", new StreamOptions
+    [Fact]
+    public async Task CommitRejectsEmptyList()
+    {
+        await Assert.ThrowsAsync<ArgumentException>(() => _db.CommitAsync(Array.Empty<NewEvent>()));
+    }
+
+    [Fact]
+    public void PreconditionHelpers()
+    {
+        var existing = JsonSerializer.Serialize(Precondition.IsSubjectExisting("/a"));
+        Assert.Equal("{\"type\":\"isSubjectExisting\",\"payload\":{\"subject\":\"/a\"}}", existing);
+        var query = JsonSerializer.Serialize(Precondition.IsQueryResultTrue("STREAM e FROM events"));
+        Assert.Equal("{\"type\":\"isQueryResultTrue\",\"payload\":{\"query\":\"STREAM e FROM events\"}}", query);
+    }
+
+    [Fact]
+    public async Task PreconditionFailedIsParsed()
+    {
+        _stub.Respond("/api/v1/commit", 412, "{\"type\":\"isSubjectNew\",\"message\":\"subject /customer/1 already exists\"}");
+        var e = await Assert.ThrowsAsync<PreconditionFailedException>(() => _db.CommitAsync(new[] { Event() }));
+        Assert.Equal(412, e.Status);
+        Assert.Equal("commit", e.Operation);
+        Assert.Equal("isSubjectNew", e.PreconditionType);
+        Assert.Equal("subject /customer/1 already exists", e.Reason);
+    }
+
+    [Fact]
+    public async Task FetchWithAndWithoutOptions()
+    {
+        _stub.Respond("/api/v1/fetch", 200, Stored + "\n" + Stored + "\n");
+        Assert.Equal(2, (await _db.FetchAsync("/customer", new FetchOptions { LowerBound = "x", IncludeLowerBoundEvent = true })).Count);
+        Assert.Equal("{\"subject\":\"/customer\",\"options\":{\"lowerBound\":\"x\",\"includeLowerBoundEvent\":true}}", _stub.Requests[^1].Body);
+        _stub.Respond("/api/v1/fetch", 200, "");
+        Assert.Empty(await _db.FetchAsync("/customer"));
+        Assert.Equal("{\"subject\":\"/customer\"}", _stub.Requests[^1].Body);
+        Assert.Empty(await _db.FetchAsync("/customer", new FetchOptions()));
+        Assert.Equal("{\"subject\":\"/customer\"}", _stub.Requests[^1].Body);
+    }
+
+    private sealed record Row(string Name);
+
+    [Fact]
+    public async Task QuerySubjectsTypes()
+    {
+        _stub.Respond("/api/v1/query", 200, "{\"name\":\"Bruce\"}\n{\"name\":\"Selina\"}\n");
+        _stub.Respond("/api/v1/subjects", 200, "{\"subject\":\"/customer\"}\n{\"subject\":\"/order\"}\n");
+        _stub.Respond("/api/v1/types", 200, "{\"type\":\"customer.created\"}\n");
+        var rows = await _db.QueryAsync("STREAM e FROM events MAP { name: e.data.name }");
+        Assert.Equal("Bruce", rows[0].GetProperty("name").GetString());
+        var typed = await _db.QueryAsync<Row>("x");
+        Assert.Equal("Selina", typed[1].Name);
+        Assert.Equal(new[] { "/customer", "/order" }, await _db.SubjectsAsync());
+        Assert.Equal(new[] { "customer.created" }, await _db.TypesAsync());
+    }
+
+    [Fact]
+    public async Task StatusIsMapped()
+    {
+        _stub.Respond("/api/v1/status", 200, "{\"engine\":{\"version\":\"2.0.0\",\"channel\":\"stable\"},\"system\":{\"os\":\"linux\"},\"events\":{\"count\":3,\"subjects\":1,\"types\":2,\"storageSize\":100},\"storage\":{\"storageFormat\":\"v2\",\"ready\":true}}");
+        var status = await _db.StatusAsync();
+        Assert.Equal("2.0.0", status.Engine.Version);
+        Assert.Equal(3, status.Events.Count);
+        Assert.True(status.Storage.Ready);
+        Assert.Equal("linux", status.System.GetProperty("os").GetString());
+    }
+
+    [Fact]
+    public async Task SchemasAndAdmin()
+    {
+        _stub.Respond("/api/v1/schemas", 201, "", "POST");
+        _stub.Respond("/api/v1/schemas", 200, "{\"type\":\"customer.created\",\"schema\":{\"type\":\"object\"}}\n", "GET");
+        _stub.Respond("/api/v1/status/audit", 200, "Audit passed");
+        _stub.Respond("/api/v1/erase", 200, "Erased");
+
+        await _db.RegisterSchemaAsync("customer.created", new { type = "object" });
+        Assert.Equal("{\"type\":\"customer.created\",\"schema\":{\"type\":\"object\"}}", _stub.Requests[^1].Body);
+        var schemas = await _db.SchemasAsync();
+        Assert.Equal("customer.created", schemas[0].Type);
+        Assert.Equal("object", schemas[0].Schema.GetProperty("type").GetString());
+        Assert.Equal("Audit passed", await _db.AuditAsync());
+        Assert.Equal("Erased", await _db.EraseAsync("/customer/1"));
+        Assert.Equal("{\"subject\":\"/customer/1\"}", _stub.Requests[^1].Body);
+    }
+
+    [Theory]
+    [InlineData(401, typeof(AuthenticationException))]
+    [InlineData(403, typeof(AuthenticationException))]
+    [InlineData(404, typeof(NotFoundException))]
+    [InlineData(409, typeof(ConflictException))]
+    [InlineData(422, typeof(UnprocessableException))]
+    [InlineData(503, typeof(NotReadyException))]
+    [InlineData(500, typeof(GenesisDbException))]
+    public async Task ErrorClasses(int status, Type expected)
+    {
+        _stub.Respond("/api/v1/fetch", status, "nope");
+        var e = await Assert.ThrowsAnyAsync<GenesisDbException>(() => _db.FetchAsync("/x"));
+        Assert.IsType(expected, e);
+        Assert.Equal(status, e.Status);
+        Assert.Equal("nope", e.Body);
+        Assert.Equal("fetch", e.Operation);
+        Assert.Contains("nope", e.Message);
+    }
+
+    [Fact]
+    public async Task SubscribeSkipsHeartbeatAndStopsOnError()
+    {
+        var stream = "data: " + Stored + "\n\ndata: {\"payload\":\"\"}\n\ndata: " + Stored + "\n\nevent: error\ndata: {\"error\":\"store closed\"}\n\n";
+        _stub.Respond("/api/v1/subscribe", 200, stream);
+        var received = new List<Event>();
+        var e = await Assert.ThrowsAsync<GenesisDbException>(async () =>
         {
-            LowerBound = "123",
-            IncludeLowerBoundEvent = true,
-            LatestByEventType = "test.type"
+            await foreach (var ev in _db.SubscribeAsync("/customer", new SubscribeOptions { Interval = TimeSpan.FromMilliseconds(500) }))
+            {
+                received.Add(ev);
+            }
+        });
+        Assert.Contains("store closed", e.Message);
+        Assert.Equal(2, received.Count);
+        Assert.Equal("{\"subject\":\"/customer\",\"interval\":0.5}", _stub.Requests[^1].Body);
+    }
+
+    [Fact]
+    public async Task SubscribeThrowsOnHttpError()
+    {
+        _stub.Respond("/api/v1/subscribe", 401, "denied");
+        await Assert.ThrowsAsync<AuthenticationException>(async () =>
+        {
+            await foreach (var _ in _db.SubscribeAsync("/customer")) Assert.Fail("no event expected");
         });
     }
 
-    [Fact]
-    public async Task StreamEventsAsync_WithUpperBound_SendsCorrectBody()
+    /// <summary>Records requests and answers from a table keyed by method and path.</summary>
+    private sealed class StubHandler : HttpMessageHandler
     {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/stream")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("options").GetProperty("upperBound").GetString() == "456" &&
-                       json.GetProperty("options").GetProperty("includeUpperBoundEvent").GetBoolean() == false;
-            })
-            .Respond("application/x-ndjson", "");
+        public sealed record Recorded(string Method, string Url, Dictionary<string, string> Headers, string Body);
 
-        await _client.StreamEventsAsync("/test", new StreamOptions
+        private readonly Dictionary<string, (int Status, string Body)> _responses = new();
+        public List<Recorded> Requests { get; } = new();
+
+        public void Respond(string path, int status, string body, string? method = null) => _responses[(method ?? "*") + " " + path] = (status, body);
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            UpperBound = "456",
-            IncludeUpperBoundEvent = false
-        });
-    }
-
-    [Fact]
-    public async Task StreamEventsAsync_EmptyResponse_ReturnsEmptyList()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/stream")
-            .Respond("application/x-ndjson", "");
-
-        var events = await _client.StreamEventsAsync("/test");
-        Assert.Empty(events);
-    }
-
-    [Fact]
-    public async Task StreamEventsAsync_ApiError_ThrowsException()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/stream")
-            .Respond(HttpStatusCode.InternalServerError);
-
-        var ex = await Assert.ThrowsAsync<GenesisDbException>(
-            () => _client.StreamEventsAsync("/test"));
-        Assert.Equal(HttpStatusCode.InternalServerError, ex.StatusCode);
-        Assert.Contains("500", ex.Message);
-    }
-
-    [Fact]
-    public async Task StreamEventsAsync_MultipleNdjsonEvents_ParsesAll()
-    {
-        var event1 = new { id = "1", source = "test", subject = "/test1", type = "test.event", data = new { n = 1 } };
-        var event2 = new { id = "2", source = "test", subject = "/test2", type = "test.event", data = new { n = 2 } };
-
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/stream")
-            .Respond("application/x-ndjson",
-                $"{JsonSerializer.Serialize(event1)}\n{JsonSerializer.Serialize(event2)}\n");
-
-        var events = await _client.StreamEventsAsync("/test");
-        Assert.Equal(2, events.Count);
-        Assert.Equal("1", events[0].Id);
-        Assert.Equal("2", events[1].Id);
-    }
-
-    #endregion
-
-    #region CommitEvents Tests
-
-    [Fact]
-    public async Task CommitEventsAsync_SendsCorrectRequest()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .With(req =>
+            var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
+            var headers = request.Headers.ToDictionary(h => h.Key, h => string.Join(" ", h.Value));
+            Requests.Add(new Recorded(request.Method.Method, request.RequestUri!.ToString(), headers, body));
+            var path = request.RequestUri!.AbsolutePath;
+            if (!_responses.TryGetValue(request.Method.Method + " " + path, out var response) && !_responses.TryGetValue("* " + path, out response))
             {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                var events = json.GetProperty("events");
-                return events.GetArrayLength() == 1 &&
-                       events[0].GetProperty("source").GetString() == "test.source" &&
-                       events[0].GetProperty("subject").GetString() == "/test/subject" &&
-                       events[0].GetProperty("type").GetString() == "test.event.created";
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.CommitEventsAsync(new[]
-        {
-            new CommitEvent
-            {
-                Source = "test.source",
-                Subject = "/test/subject",
-                Type = "test.event.created",
-                Data = new { name = "Test Event" }
+                throw new HttpRequestException("no stub for " + path);
             }
-        });
-    }
-
-    [Fact]
-    public async Task CommitEventsAsync_WithOptions_IncludesOptions()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("events")[0]
-                    .GetProperty("options")
-                    .GetProperty("storeDataAsReference")
-                    .GetBoolean() == true;
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.CommitEventsAsync(new[]
-        {
-            new CommitEvent
-            {
-                Source = "test.source",
-                Subject = "/test/subject",
-                Type = "test.event.created",
-                Data = new { name = "Test Event" },
-                Options = new CommitEventOptions { StoreDataAsReference = true }
-            }
-        });
-    }
-
-    [Fact]
-    public async Task CommitEventsAsync_WithPreconditions_IncludesPreconditions()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                var preconditions = json.GetProperty("preconditions");
-                return preconditions.GetArrayLength() == 1 &&
-                       preconditions[0].GetProperty("type").GetString() == "isSubjectNew";
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.CommitEventsAsync(
-            new[]
-            {
-                new CommitEvent
-                {
-                    Source = "test.source",
-                    Subject = "/test/subject",
-                    Type = "test.event.created",
-                    Data = new { name = "Test Event" }
-                }
-            },
-            new[] { Preconditions.IsSubjectNew("/test/subject") }
-        );
-    }
-
-    [Fact]
-    public async Task CommitEventsAsync_WithIsSubjectExisting_IncludesPrecondition()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("preconditions")[0]
-                    .GetProperty("type").GetString() == "isSubjectExisting";
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.CommitEventsAsync(
-            new[]
-            {
-                new CommitEvent { Source = "test", Subject = "/test/subject", Type = "test.updated", Data = new { v = 2 } }
-            },
-            new[] { Preconditions.IsSubjectExisting("/test/subject") }
-        );
-    }
-
-    [Fact]
-    public async Task CommitEventsAsync_WithIsQueryResultTrue_IncludesPrecondition()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("preconditions")[0]
-                    .GetProperty("type").GetString() == "isQueryResultTrue";
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.CommitEventsAsync(
-            new[]
-            {
-                new CommitEvent { Source = "test", Subject = "/test", Type = "test.created", Data = new { } }
-            },
-            new[] { Preconditions.IsQueryResultTrue("STREAM e FROM events WHERE e.subject == '/test' MAP COUNT() < 100") }
-        );
-    }
-
-    [Fact]
-    public async Task CommitEventsAsync_WithMultipleMixedPreconditions()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                var preconditions = json.GetProperty("preconditions");
-                return preconditions.GetArrayLength() == 2 &&
-                       preconditions[0].GetProperty("type").GetString() == "isSubjectExisting" &&
-                       preconditions[1].GetProperty("type").GetString() == "isQueryResultTrue";
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.CommitEventsAsync(
-            new[]
-            {
-                new CommitEvent { Source = "test", Subject = "/user/456", Type = "test.user-updated", Data = new { name = "Jane" } }
-            },
-            new[]
-            {
-                Preconditions.IsSubjectExisting("/user/456"),
-                Preconditions.IsQueryResultTrue("STREAM e FROM events WHERE e.data.email == 'john.doe@example.com' MAP COUNT() == 0")
-            }
-        );
-    }
-
-    [Fact]
-    public async Task CommitEventsAsync_WithGenericPrecondition()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("preconditions")[0]
-                    .GetProperty("type").GetString() == "someCustomFuturePrecondition";
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.CommitEventsAsync(
-            new[]
-            {
-                new CommitEvent { Source = "test", Subject = "/test", Type = "test.created", Data = new { } }
-            },
-            new[]
-            {
-                new Precondition
-                {
-                    Type = "someCustomFuturePrecondition",
-                    Payload = new { foo = "bar", baz = 123 }
-                }
-            }
-        );
-    }
-
-    [Fact]
-    public async Task CommitEventsAsync_ApiError_ThrowsException()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/commit")
-            .Respond(HttpStatusCode.BadRequest);
-
-        var ex = await Assert.ThrowsAsync<GenesisDbException>(
-            () => _client.CommitEventsAsync(new[]
-            {
-                new CommitEvent { Source = "test", Subject = "/test", Type = "test.event", Data = new { } }
-            }));
-        Assert.Equal(HttpStatusCode.BadRequest, ex.StatusCode);
-    }
-
-    #endregion
-
-    #region EraseData Tests
-
-    [Fact]
-    public async Task EraseDataAsync_SendsCorrectRequest()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/erase")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("subject").GetString() == "/test/subject";
-            })
-            .Respond(HttpStatusCode.OK);
-
-        await _client.EraseDataAsync("/test/subject");
-    }
-
-    [Fact]
-    public async Task EraseDataAsync_ApiError_ThrowsException()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/erase")
-            .Respond(HttpStatusCode.NotFound);
-
-        var ex = await Assert.ThrowsAsync<GenesisDbException>(
-            () => _client.EraseDataAsync("/test/subject"));
-        Assert.Equal(HttpStatusCode.NotFound, ex.StatusCode);
-    }
-
-    #endregion
-
-    #region Audit Tests
-
-    [Fact]
-    public async Task AuditAsync_ReturnsAuditString()
-    {
-        _mockHttp.When(HttpMethod.Get, "http://localhost:8080/api/v1/status/audit")
-            .Respond("text/plain", "Audit successful");
-
-        var result = await _client.AuditAsync();
-        Assert.Equal("Audit successful", result);
-    }
-
-    [Fact]
-    public async Task AuditAsync_ApiError_ThrowsException()
-    {
-        _mockHttp.When(HttpMethod.Get, "http://localhost:8080/api/v1/status/audit")
-            .Respond(HttpStatusCode.InternalServerError);
-
-        var ex = await Assert.ThrowsAsync<GenesisDbException>(() => _client.AuditAsync());
-        Assert.Equal(HttpStatusCode.InternalServerError, ex.StatusCode);
-    }
-
-    #endregion
-
-    #region Ping Tests
-
-    [Fact]
-    public async Task PingAsync_ReturnsPong()
-    {
-        _mockHttp.When(HttpMethod.Get, "http://localhost:8080/api/v1/status/ping")
-            .Respond("text/plain", "pong");
-
-        var result = await _client.PingAsync();
-        Assert.Equal("pong", result);
-    }
-
-    [Fact]
-    public async Task PingAsync_ApiError_ThrowsException()
-    {
-        _mockHttp.When(HttpMethod.Get, "http://localhost:8080/api/v1/status/ping")
-            .Respond(HttpStatusCode.ServiceUnavailable);
-
-        var ex = await Assert.ThrowsAsync<GenesisDbException>(() => _client.PingAsync());
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, ex.StatusCode);
-    }
-
-    #endregion
-
-    #region Query Tests
-
-    [Fact]
-    public async Task QueryAsync_ReturnsResults()
-    {
-        var result1 = new { id = "1", name = "Result 1" };
-        var result2 = new { id = "2", name = "Result 2" };
-
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/q")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("query").GetString() == "STREAM e FROM events MAP e.data";
-            })
-            .Respond("application/x-ndjson",
-                $"{JsonSerializer.Serialize(result1)}\n{JsonSerializer.Serialize(result2)}\n");
-
-        var results = await _client.QueryAsync("STREAM e FROM events MAP e.data");
-
-        Assert.Equal(2, results.Count);
-        Assert.Equal("1", results[0].GetProperty("id").GetString());
-        Assert.Equal("2", results[1].GetProperty("id").GetString());
-    }
-
-    [Fact]
-    public async Task QueryAsync_EmptyResults_ReturnsEmptyList()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/q")
-            .Respond("application/x-ndjson", "");
-
-        var results = await _client.QueryAsync("STREAM e FROM events WHERE false");
-        Assert.Empty(results);
-    }
-
-    [Fact]
-    public async Task QueryAsync_ApiError_ThrowsException()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/q")
-            .Respond(HttpStatusCode.BadRequest);
-
-        var ex = await Assert.ThrowsAsync<GenesisDbException>(
-            () => _client.QueryAsync("INVALID QUERY"));
-        Assert.Equal(HttpStatusCode.BadRequest, ex.StatusCode);
-    }
-
-    [Fact]
-    public async Task QueryEventsAsync_DelegatesToQueryAsync()
-    {
-        var result = new { id = "1", name = "Result" };
-
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/q")
-            .Respond("application/x-ndjson", JsonSerializer.Serialize(result) + "\n");
-
-        var results = await _client.QueryEventsAsync("STREAM e FROM events");
-        Assert.Single(results);
-    }
-
-    #endregion
-
-    #region ObserveEvents Tests
-
-    [Fact]
-    public async Task ObserveEventsAsync_YieldsEvents()
-    {
-        var event1 = new { id = "1", source = "test", subject = "/test", type = "test.event", data = new { n = 1 } };
-        var event2 = new { id = "2", source = "test", subject = "/test", type = "test.event", data = new { n = 2 } };
-
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/observe")
-            .Respond("application/x-ndjson",
-                $"{JsonSerializer.Serialize(event1)}\n{JsonSerializer.Serialize(event2)}\n");
-
-        var events = new List<CloudEvent>();
-        await foreach (var e in _client.ObserveEventsAsync("/test"))
-        {
-            events.Add(e);
-        }
-
-        Assert.Equal(2, events.Count);
-        Assert.Equal("1", events[0].Id);
-        Assert.Equal("2", events[1].Id);
-    }
-
-    [Fact]
-    public async Task ObserveEventsAsync_HandlesSseFormat()
-    {
-        var ev = new { id = "1", source = "test", subject = "/test", type = "test.event", data = new { n = 1 } };
-
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/observe")
-            .Respond("application/x-ndjson", $"data: {JsonSerializer.Serialize(ev)}\n");
-
-        var events = new List<CloudEvent>();
-        await foreach (var e in _client.ObserveEventsAsync("/test"))
-        {
-            events.Add(e);
-        }
-
-        Assert.Single(events);
-        Assert.Equal("1", events[0].Id);
-    }
-
-    [Fact]
-    public async Task ObserveEventsAsync_WithOptions_SendsCorrectBody()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/observe")
-            .With(req =>
-            {
-                var body = req.Content!.ReadAsStringAsync().Result;
-                var json = JsonSerializer.Deserialize<JsonElement>(body);
-                return json.GetProperty("options").GetProperty("lowerBound").GetString() == "123" &&
-                       json.GetProperty("options").GetProperty("includeLowerBoundEvent").GetBoolean() == true;
-            })
-            .Respond("application/x-ndjson", "");
-
-        await foreach (var _ in _client.ObserveEventsAsync("/test", new StreamOptions
-        {
-            LowerBound = "123",
-            IncludeLowerBoundEvent = true
-        }))
-        {
-            break;
+            return new HttpResponseMessage((HttpStatusCode)response.Status) { Content = new StringContent(response.Body, Encoding.UTF8, "text/plain") };
         }
     }
-
-    [Fact]
-    public async Task ObserveEventsAsync_ApiError_ThrowsException()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/observe")
-            .Respond(HttpStatusCode.InternalServerError);
-
-        await Assert.ThrowsAsync<GenesisDbException>(async () =>
-        {
-            await foreach (var _ in _client.ObserveEventsAsync("/test"))
-            {
-                break;
-            }
-        });
-    }
-
-    #endregion
-
-    #region Authorization Header Tests
-
-    [Fact]
-    public async Task AllRequests_IncludeBearerToken()
-    {
-        _mockHttp.When(HttpMethod.Post, "http://localhost:8080/api/v1/stream")
-            .With(req => req.Headers.Authorization?.Scheme == "Bearer" &&
-                         req.Headers.Authorization?.Parameter == "test-token")
-            .Respond("application/x-ndjson", "");
-
-        await _client.StreamEventsAsync("/test");
-    }
-
-    #endregion
 }

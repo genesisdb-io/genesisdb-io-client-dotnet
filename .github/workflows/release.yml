@@ -1,0 +1,30 @@
+name: Release
+
+# Triggered by hand. Publishes the version in GenesisDB.Client.csproj to NuGet and tags it.
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            6.0.x
+            8.0.x
+      - run: dotnet test -c Release
+      - run: dotnet pack GenesisDB.Client -c Release -o artifacts
+      - name: Tag
+        run: |
+          version="$(grep -oPm1 '(?<=<Version>)[^<]+' GenesisDB.Client/GenesisDB.Client.csproj)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$version" -m "v$version"
+          git push origin "v$version"
+      - run: dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}

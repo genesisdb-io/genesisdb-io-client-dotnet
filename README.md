@@ -1,569 +1,184 @@
-# .NET SDK
+# GenesisDB client for .NET
 
-This is the official .NET SDK for GenesisDB, an awesome and production ready event sourcing database system for building event-driven apps.
+The official client for [GenesisDB](https://www.genesisdb.io), the open source event sourcing database. .NET 6 and 8, async throughout, built on `HttpClient` and `System.Text.Json`, no further dependencies.
 
-## GenesisDB Advantages
-
-* Incredibly fast when reading, fast when writing 🚀
-* Easy backup creation and recovery
-* [CloudEvents](https://cloudevents.io/) compatible
-* GDPR-ready
-* Easily accessible via the HTTP interface
-* Auditable. Guarantee database consistency
-* Logging and metrics for Prometheus
-* SQL like query language called GenesisDB Query Language (GDBQL)
-* ...
-
-## Installation
-
-### NuGet Package
+> **Version 2.0.0 targets GenesisDB 2.0 and is not compatible with GenesisDB 1.x servers or with the 1.x client API.** Routes, configuration, type names and method signatures have changed. Keep a 1.x client for a 1.x server.
+>
+> Existing 1.x clients keep working against a GenesisDB 2.0 server through deprecated route aliases, so the server can be upgraded first and the clients at your own pace. New 2.0 features (stored events returned by commit, upper bounds, schemas, typed errors) need this 2.0.0 client.
 
 ```bash
 dotnet add package GenesisDB.Client
 ```
 
-### Package Manager
-
-```powershell
-Install-Package GenesisDB.Client
-```
-
-## Configuration
-
-### Environment Variables
-
-The following environment variables are required when no explicit configuration is provided:
-
-```
-GENESISDB_AUTH_TOKEN=<secret>
-GENESISDB_API_URL=http://localhost:8080
-GENESISDB_API_VERSION=v1
-```
-
-### Basic Setup
+## Quick start
 
 ```csharp
 using GenesisDB.Client;
 
-// Initialize from environment variables
-using var client = new GenesisDbClient();
+using var db = new GenesisDbClient("http://localhost:8080", Environment.GetEnvironmentVariable("GENESISDB_AUTH_TOKEN"));
 
-// Or initialize with explicit configuration
-using var client = new GenesisDbClient(new ClientConfig
+await db.CommitAsync(new[]
 {
-    ApiUrl = "http://localhost:8080",
-    ApiVersion = "v1",
-    AuthToken = "secret"
+    new NewEvent("io.example.shop", "/customer/42", "io.example.shop.customer-registered", new { name = "Bruce Wayne" }),
 });
+
+var events = await db.FetchAsync("/customer/42");
 ```
 
-### Custom HttpClient (for DI / testing)
+`url` and `token` fall back to `GENESISDB_URL` and `GENESISDB_AUTH_TOKEN`, so `new GenesisDbClient()` works in an environment that sets both. The client is thread-safe and shares one `HttpClient`, register it as a singleton.
+
+## Events
 
 ```csharp
-using var client = new GenesisDbClient(
-    new ClientConfig
-    {
-        ApiUrl = "http://localhost:8080",
-        ApiVersion = "v1",
-        AuthToken = "secret"
-    },
-    httpClient  // your own HttpClient instance
-);
-```
-
-## Streaming Events
-
-### Basic Event Streaming
-
-```csharp
-// Stream all events for a subject
-var events = await client.StreamEventsAsync("/customer");
-
-foreach (var e in events)
+// Commit a batch atomically. The server assigns ID, time and hashes and returns the stored events.
+var stored = await db.CommitAsync(new[]
 {
-    Console.WriteLine($"{e.Id}: {e.Type} — {e.GetDataValue<string>("firstName")}");
-}
-```
-
-### Stream Events from Lower Bound
-
-```csharp
-var events = await client.StreamEventsAsync("/", new StreamOptions
-{
-    LowerBound = "2d6d4141-6107-4fb2-905f-445730f4f2a9",
-    IncludeLowerBoundEvent = true
+    new NewEvent("io.example.shop", "/order/1", "io.example.shop.order-placed", new { total = 99.5 }),
+    new NewEvent("io.example.shop", "/order/1/item/1", "io.example.shop.item-added", new { sku = "A1", qty = 2 }),
 });
+stored[0].Id;    // "3f2c..."
+stored[0].Hash;  // "a9b1..."
+stored[0].Time;  // DateTimeOffset
+stored[0].Data;  // JsonElement
+
+// A subject with one segment gets a generated ID appended.
+await db.CommitAsync(new[] { new NewEvent("io.example.shop", "/customer", "io.example.shop.customer-registered", new { name = "Selina" }) });
+
+// Fetch a subject with all descendants, in commit order.
+var all = await db.FetchAsync("/order/1");
+
+// Resume after a known event, or stop at one.
+var since = await db.FetchAsync("/order", new FetchOptions { LowerBound = lastSeenId, IncludeLowerBoundEvent = false });
+var until = await db.FetchAsync("/order", new FetchOptions { UpperBound = someId, IncludeUpperBoundEvent = true });
+
+// Only the newest event of a type below the subject.
+var latest = await db.FetchAsync("/order/1", new FetchOptions { LatestByEventType = "io.example.shop.order-placed" });
+
+// Typed payloads
+record Order(double Total);
+var order = stored[0].DataAs<Order>();
 ```
 
-### Stream Events with Upper Bound
-
-```csharp
-var events = await client.StreamEventsAsync("/", new StreamOptions
-{
-    UpperBound = "9f3e4141-7208-4fb2-905f-445730f4f3b1",
-    IncludeUpperBoundEvent = false
-});
-```
-
-### Stream Events with Both Lower and Upper Bounds
-
-```csharp
-var events = await client.StreamEventsAsync("/", new StreamOptions
-{
-    LowerBound = "2d6d4141-6107-4fb2-905f-445730f4f2a9",
-    IncludeLowerBoundEvent = true,
-    UpperBound = "9f3e4141-7208-4fb2-905f-445730f4f3b1",
-    IncludeUpperBoundEvent = false
-});
-```
-
-### Stream Latest Events by Event Type
-
-```csharp
-var events = await client.StreamEventsAsync("/", new StreamOptions
-{
-    LatestByEventType = "io.genesisdb.app.customer-updated"
-});
-```
-
-This feature allows you to stream only the latest event of a specific type for each subject. Useful for getting the current state of entities.
-
-## Committing Events
-
-### Basic Event Committing
-
-```csharp
-await client.CommitEventsAsync(new[]
-{
-    new CommitEvent
-    {
-        Source = "io.genesisdb.app",
-        Subject = "/customer",
-        Type = "io.genesisdb.app.customer-added",
-        Data = new
-        {
-            firstName = "Bruce",
-            lastName = "Wayne",
-            emailAddress = "bruce.wayne@enterprise.wayne"
-        }
-    },
-    new CommitEvent
-    {
-        Source = "io.genesisdb.app",
-        Subject = "/customer",
-        Type = "io.genesisdb.app.customer-added",
-        Data = new
-        {
-            firstName = "Alfred",
-            lastName = "Pennyworth",
-            emailAddress = "alfred.pennyworth@enterprise.wayne"
-        }
-    },
-    new CommitEvent
-    {
-        Source = "io.genesisdb.store",
-        Subject = "/article",
-        Type = "io.genesisdb.store.article-added",
-        Data = new
-        {
-            name = "Tumbler",
-            color = "black",
-            price = 2990000.00
-        }
-    },
-    new CommitEvent
-    {
-        Source = "io.genesisdb.app",
-        Subject = "/customer/fed2902d-0135-460d-8605-263a06308448",
-        Type = "io.genesisdb.app.customer-personaldata-changed",
-        Data = new
-        {
-            firstName = "Angus",
-            lastName = "MacGyver",
-            emailAddress = "angus.macgyer@phoenix.foundation"
-        }
-    }
-});
-```
+`data` accepts an anonymous object, a dictionary, a `JsonElement` or any class that serialises to a JSON object.
 
 ## Preconditions
 
-Preconditions allow you to enforce certain checks on the server before committing events. GenesisDB supports multiple precondition types:
-
-### isSubjectNew
-
-Ensures that a subject is new (has no existing events):
-
-```csharp
-await client.CommitEventsAsync(
-    new[]
-    {
-        new CommitEvent
-        {
-            Source = "io.genesisdb.app",
-            Subject = "/user/456",
-            Type = "io.genesisdb.app.user-created",
-            Data = new
-            {
-                firstName = "John",
-                lastName = "Doe",
-                email = "john.doe@example.com"
-            }
-        }
-    },
-    new[] { Preconditions.IsSubjectNew("/user/456") }
-);
-```
-
-### isSubjectExisting
-
-Ensures that events exist for the specified subject:
-
-```csharp
-await client.CommitEventsAsync(
-    new[]
-    {
-        new CommitEvent
-        {
-            Source = "io.genesisdb.app",
-            Subject = "/user/456",
-            Type = "io.genesisdb.app.user-updated",
-            Data = new
-            {
-                firstName = "John",
-                lastName = "Doe",
-                email = "john.doe@example.com"
-            }
-        }
-    },
-    new[] { Preconditions.IsSubjectExisting("/user/456") }
-);
-```
-
-### isQueryResultTrue
-
-Evaluates a query and ensures the result is truthy. Supports the full GDBQL feature set including complex WHERE clauses, aggregations, and calculated fields.
-
-**Basic uniqueness check:**
-
-```csharp
-await client.CommitEventsAsync(
-    new[]
-    {
-        new CommitEvent
-        {
-            Source = "io.genesisdb.app",
-            Subject = "/user/456",
-            Type = "io.genesisdb.app.user-created",
-            Data = new
-            {
-                firstName = "John",
-                lastName = "Doe",
-                email = "john.doe@example.com"
-            }
-        }
-    },
-    new[] { Preconditions.IsQueryResultTrue(
-        "STREAM e FROM events WHERE e.data.email == 'john.doe@example.com' MAP COUNT() == 0"
-    ) }
-);
-```
-
-**Business rule enforcement (transaction limits):**
-
-```csharp
-await client.CommitEventsAsync(
-    new[]
-    {
-        new CommitEvent
-        {
-            Source = "io.genesisdb.banking",
-            Subject = "/user/123/transactions",
-            Type = "io.genesisdb.banking.transaction-processed",
-            Data = new { amount = 500.00, currency = "EUR" }
-        }
-    },
-    new[] { Preconditions.IsQueryResultTrue(
-        "STREAM e FROM events WHERE e.subject UNDER '/user/123' AND e.type == 'transaction-processed' AND e.time >= '2024-01-01T00:00:00Z' MAP SUM(e.data.amount) + 500 <= 10000"
-    ) }
-);
-```
-
-**Complex validation with aggregations:**
-
-```csharp
-await client.CommitEventsAsync(
-    new[]
-    {
-        new CommitEvent
-        {
-            Source = "io.genesisdb.events",
-            Subject = "/conference/2024/registrations",
-            Type = "io.genesisdb.events.registration-created",
-            Data = new { attendeeId = "att-789", ticketType = "premium" }
-        }
-    },
-    new[] { Preconditions.IsQueryResultTrue(
-        "STREAM e FROM events WHERE e.subject UNDER '/conference/2024/registrations' AND e.type == 'registration-created' GROUP BY e.data.ticketType HAVING e.data.ticketType == 'premium' MAP COUNT() < 50"
-    ) }
-);
-```
-
-### Generic Preconditions
-
-For forward compatibility with future precondition types, you can use the generic `Precondition` class directly:
-
-```csharp
-await client.CommitEventsAsync(
-    events,
-    new[]
-    {
-        new Precondition
-        {
-            Type = "someCustomFuturePrecondition",
-            Payload = new { foo = "bar", baz = 123 }
-        }
-    }
-);
-```
-
-**Supported GDBQL Features in Preconditions:**
-- WHERE conditions with AND/OR/IN/BETWEEN operators
-- Hierarchical subject queries (UNDER, DESCENDANTS)
-- Aggregation functions (COUNT, SUM, AVG, MIN, MAX)
-- GROUP BY with HAVING clauses
-- ORDER BY and LIMIT clauses
-- Calculated fields and expressions
-- Nested field access (e.data.address.city)
-- String concatenation and arithmetic operations
-
-If a precondition fails, the commit throws a `GenesisDbException` with HTTP 412 (Precondition Failed).
-
-## GDPR Compliance
-
-### Store Data as Reference
-
-```csharp
-await client.CommitEventsAsync(new[]
-{
-    new CommitEvent
-    {
-        Source = "io.genesisdb.app",
-        Subject = "/user/456",
-        Type = "io.genesisdb.app.user-created",
-        Data = new
-        {
-            firstName = "John",
-            lastName = "Doe",
-            email = "john.doe@example.com"
-        },
-        Options = new CommitEventOptions { StoreDataAsReference = true }
-    }
-});
-```
-
-### Delete Referenced Data
-
-```csharp
-await client.EraseDataAsync("/user/456");
-```
-
-## Observing Events
-
-The `ObserveEventsAsync` method returns an `IAsyncEnumerable<CloudEvent>`, which keeps the connection open and yields events as they arrive in real time.
-
-### Basic Event Observation
-
-```csharp
-await foreach (var e in client.ObserveEventsAsync("/customer"))
-{
-    Console.WriteLine($"Received: {e.Id} — {e.Type}");
-}
-```
-
-### Observe Events from Lower Bound (Message Queue)
-
-```csharp
-await foreach (var e in client.ObserveEventsAsync("/customer", new StreamOptions
-{
-    LowerBound = "2d6d4141-6107-4fb2-905f-445730f4f2a9",
-    IncludeLowerBoundEvent = true
-}))
-{
-    Console.WriteLine($"Received: {e.Id}");
-}
-```
-
-### Observe Events with Upper Bound (Message Queue)
-
-```csharp
-await foreach (var e in client.ObserveEventsAsync("/customer", new StreamOptions
-{
-    UpperBound = "9f3e4141-7208-4fb2-905f-445730f4f3b1",
-    IncludeUpperBoundEvent = false
-}))
-{
-    Console.WriteLine($"Received: {e.Id}");
-}
-```
-
-### Observe Events with Both Bounds (Message Queue)
-
-```csharp
-await foreach (var e in client.ObserveEventsAsync("/customer", new StreamOptions
-{
-    LowerBound = "2d6d4141-6107-4fb2-905f-445730f4f2a9",
-    IncludeLowerBoundEvent = true,
-    UpperBound = "9f3e4141-7208-4fb2-905f-445730f4f3b1",
-    IncludeUpperBoundEvent = false
-}))
-{
-    Console.WriteLine($"Received: {e.Id}");
-}
-```
-
-### Observe Latest Events by Event Type (Message Queue)
-
-```csharp
-await foreach (var e in client.ObserveEventsAsync("/customer", new StreamOptions
-{
-    LatestByEventType = "io.genesisdb.app.customer-updated"
-}))
-{
-    Console.WriteLine($"Received latest: {e.Id}");
-}
-```
-
-### Cancellation Support
-
-Use a `CancellationToken` to gracefully stop observing:
-
-```csharp
-using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-
-await foreach (var e in client.ObserveEventsAsync("/customer", cancellationToken: cts.Token))
-{
-    Console.WriteLine($"Received: {e.Id}");
-
-    if (someCondition)
-    {
-        cts.Cancel(); // stop observing
-    }
-}
-```
-
-## Querying Events
-
-```csharp
-var results = await client.QueryEventsAsync(
-    "STREAM e FROM events WHERE e.type == 'io.genesisdb.app.customer-added' ORDER BY e.time DESC LIMIT 20 MAP { subject: e.subject, firstName: e.data.firstName }"
-);
-
-foreach (var result in results)
-{
-    Console.WriteLine($"{result.GetProperty("subject")} — {result.GetProperty("firstName")}");
-}
-```
-
-Query results are returned as `List<JsonElement>`, giving you full flexibility to access any shape of data:
-
-```csharp
-var results = await client.QueryAsync(
-    "STREAM e FROM events WHERE e.subject == '/customer/123' MAP e.data"
-);
-
-foreach (var row in results)
-{
-    var firstName = row.GetProperty("firstName").GetString();
-    var age = row.GetProperty("age").GetInt32();
-}
-```
-
-## Working with CloudEvent Data
-
-The `CloudEvent` class provides helper methods for accessing event data:
-
-```csharp
-var events = await client.StreamEventsAsync("/customer");
-
-foreach (var e in events)
-{
-    // Access individual properties
-    var firstName = e.GetDataValue<string>("firstName");
-    var age = e.GetDataValue<int>("age");
-
-    // Or deserialize the entire data payload to a typed object
-    var customer = e.GetData<CustomerData>();
-}
-```
-
-## Error Handling
-
-API errors throw a `GenesisDbException` with the HTTP status code and reason:
+Preconditions are checked atomically with the commit. A failed precondition throws `PreconditionFailedException` and writes nothing.
 
 ```csharp
 try
 {
-    await client.CommitEventsAsync(events, preconditions);
+    await db.CommitAsync(
+        new[] { new NewEvent("io.example.shop", "/customer/42", "io.example.shop.customer-registered", new { email = "bruce@example.com" }) },
+        new[]
+        {
+            Precondition.IsSubjectNew("/customer/42"),
+            Precondition.IsQueryResultTrue("STREAM e FROM events WHERE e.data.email == 'bruce@example.com' MAP COUNT() == 0"),
+        });
 }
-catch (GenesisDbException ex) when (ex.StatusCode == System.Net.HttpStatusCode.PreconditionFailed)
+catch (PreconditionFailedException e)
 {
-    Console.WriteLine("Precondition failed — commit rejected");
-}
-catch (GenesisDbException ex)
-{
-    Console.WriteLine($"API error: {ex.StatusCode} — {ex.ReasonPhrase}");
+    Console.WriteLine($"{e.PreconditionType}: {e.Reason}"); // "isSubjectNew: subject /customer/42 already has events"
 }
 ```
 
-## Health Checks
+Factories: `IsSubjectNew`, `IsSubjectExisting`, `IsQueryResultTrue`.
+
+## Subscriptions
+
+`SubscribeAsync` returns an `IAsyncEnumerable<Event>` over Server-Sent Events. It yields the existing history first, then new events as they are committed, and runs until the token is cancelled.
 
 ```csharp
-// Check API status
-var pingResponse = await client.PingAsync();
-Console.WriteLine($"Ping: {pingResponse}");
+using var stop = new CancellationTokenSource();
 
-// Run audit to check event consistency
-var auditResponse = await client.AuditAsync();
-Console.WriteLine($"Audit: {auditResponse}");
+await foreach (var e in db.SubscribeAsync("/order", new SubscribeOptions { Interval = TimeSpan.FromMilliseconds(500) }, stop.Token))
+{
+    Console.WriteLine($"{e.Type} {e.Data}");
+}
 ```
 
-## API Reference
+`Interval` is the poll interval (default 1 s). The bound options of `FetchOptions` work here as well through `SubscribeOptions.Fetch`, so a consumer that persists the last processed event ID resumes with `LowerBound`. A stream the server ends with an error throws `GenesisDbException`.
 
-| Method | Description |
-|---|---|
-| `PingAsync()` | Pings the server, returns a string response |
-| `AuditAsync()` | Runs an audit check, returns audit information |
-| `CommitEventsAsync(events, preconditions?)` | Commits one or more events with optional preconditions |
-| `StreamEventsAsync(subject, options?)` | Streams events for a subject, returns `List<CloudEvent>` |
-| `EraseDataAsync(subject)` | Erases referenced data for GDPR compliance |
-| `QueryAsync(query)` | Executes a GDBQL query, returns `List<JsonElement>` |
-| `QueryEventsAsync(query)` | Alias for `QueryAsync` |
-| `ObserveEventsAsync(subject, options?, cancellationToken)` | Observes events in real time via `IAsyncEnumerable<CloudEvent>` |
+## Queries
 
-## Running Tests
+[GDBQL](https://github.com/genesisdb-io/genesisdb/blob/main/docs/gdbql.md) runs on the server. Results come back as rows, a bare aggregate as a single-element list.
+
+```csharp
+var rows = await db.QueryAsync("STREAM e FROM events WHERE e.subject UNDER '/customer' MAP { name: e.data.name, total: e.data.total }");
+
+record Row(string Name, double Total);
+var typed = await db.QueryAsync<Row>("STREAM e FROM events WHERE e.subject UNDER '/customer' MAP { name: e.data.name, total: e.data.total }");
+
+var count = await db.QueryAsync<int>("STREAM e FROM events WHERE e.type == 'io.example.shop.order-placed' MAP COUNT()");
+
+var byCategory = await db.QueryAsync(
+    "STREAM e FROM events WHERE e.type == 'io.example.shop.item-added' GROUP BY e.data.category MAP { category: e.data.category, items: COUNT(), revenue: SUM(e.data.total) }");
+```
+
+## GDPR: reference payloads and erasure
+
+Store a payload as reference data and it can be erased later. The event, its hash and the chain stay intact, the payload becomes `{}`.
+
+```csharp
+await db.CommitAsync(new[]
+{
+    new NewEvent("io.example.shop", "/customer/42", "io.example.shop.customer-registered", new { name = "Bruce", email = "bruce@example.com" }).AsReference(),
+});
+
+await db.EraseAsync("/customer/42"); // administrator token
+```
+
+Inline payloads are immutable. `EraseAsync` on a subject without reference payloads throws `UnprocessableException` (422).
+
+## Schemas
+
+```csharp
+await db.RegisterSchemaAsync("io.example.shop.order-placed", new
+{
+    type = "object",
+    properties = new { total = new { type = "number" }, currency = new { type = "string" } },
+    required = new[] { "total" },
+});
+
+var schemas = await db.SchemasAsync();
+```
+
+Commits of that type are validated. A violation throws `GenesisDbException` with status 400.
+
+## Catalog, status, administration
+
+```csharp
+await db.SubjectsAsync();        // ["/customer", "/order"]
+await db.TypesAsync();           // ["io.example.shop.customer-registered", ...]
+await db.StatusAsync();          // engine version, event counts, storage format, readiness
+await db.PingAsync();            // "Pong", no token required
+
+await db.AuditAsync();           // "Audit passed. All 1234 events integrity checks succeeded."
+```
+
+Audit, erase and schema registration need the administrator token. Everything else works with a reader token (`GENESISDB_READ_TOKEN`), commit additionally with a writer token.
+
+## Errors
+
+Every non-2xx answer throws `GenesisDbException` with `Status`, `Body` and `Operation`. Subclasses: `PreconditionFailedException` (412, with `PreconditionType` and `Reason`), `AuthenticationException` (401, 403), `NotFoundException` (404), `ConflictException` (409), `UnprocessableException` (422), `NotReadyException` (503). Transport failures and timeouts throw `GenesisDbException` with status 0 and the cause as inner exception.
+
+## Configuration
+
+```csharp
+new GenesisDbClient(
+    url: "http://localhost:8080",          // or GENESISDB_URL
+    token: "...",                          // or GENESISDB_AUTH_TOKEN
+    timeout: TimeSpan.FromSeconds(30),     // for non-streaming calls
+    http: new HttpClient(handler));        // optional, bring your own HttpClient (proxies, TLS, handlers)
+```
+
+## Development
 
 ```bash
-# Unit tests (no server required)
-dotnet test --filter "Category!=Integration"
-
-# Integration tests (requires GenesisDB on localhost:8080)
-dotnet test --filter "Category=Integration"
-
-# All tests
-dotnet test
+dotnet test                                                                              # unit tests against a stubbed handler
+GENESISDB_URL=http://localhost:8080 GENESISDB_AUTH_TOKEN=... dotnet test                 # also runs IntegrationTests against a running GenesisDB
 ```
-
-## Requirements
-
-- .NET 8.0 or later
 
 ## License
 
 MIT
-
-## Author
-
-* E-Mail: mail@genesisdb.io
-* URL: https://www.genesisdb.io
-* Docs: https://docs.genesisdb.io
